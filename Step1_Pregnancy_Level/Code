@@ -1,6 +1,6 @@
 """
-[Step1] Twin-pair CNN + Maternal MLP for pregnancy-level binary classification
-from Raman spectra.
+Twin-pair CNN + Maternal MLP for pregnancy-level binary classification
+from Raman spectra. (Step 1)
 
 Inputs
 ------
@@ -256,7 +256,7 @@ def save_training_curves(history, save_dir):
     np.savetxt(os.path.join(save_dir, "val_acc.csv"), history.history["val_accuracy"], delimiter=",")
 
 
-def save_auc_and_bar(y_true, y_score, n_hc, save_dir, prefix):
+def save_auc_and_bar(y_true, y_score, save_dir, prefix):
     fpr, tpr, thr = roc_curve(y_true, y_score)
     roc_auc = auc(fpr, tpr)
 
@@ -272,8 +272,9 @@ def save_auc_and_bar(y_true, y_score, n_hc, save_dir, prefix):
                 dpi=300, bbox_inches="tight")
     plt.close()
 
-    bar_hc = y_score[:n_hc]
-    bar_rd = y_score[n_hc:]
+    # Select by label so the split is correct even when y_true is shuffled.
+    bar_hc = y_score[y_true == 0]
+    bar_rd = y_score[y_true == 1]
     idx_hc = np.arange(0, len(bar_hc))
     idx_rd = np.arange(len(bar_hc) + 2, len(bar_hc) + 2 + len(bar_rd))
 
@@ -427,18 +428,16 @@ val_pred_pair = model.predict([x_val, m_val], verbose=0)
 val_score_preg, val_true_preg = aggregate_to_pregnancy(val_pred_pair, g_val, y_val_preg)
 val_pred_cls = (val_score_preg >= 0.5).astype(int)
 val_preg_acc = accuracy_score(val_true_preg.astype(int), val_pred_cls)
-n_val_hc = int(np.sum(val_true_preg == 0))
 val_auc, val_bar_hc, val_bar_rd = save_auc_and_bar(
-    val_true_preg, val_score_preg, n_val_hc, save_dir, prefix="Val"
+    val_true_preg, val_score_preg, save_dir, prefix="Val"
 )
 
 test_pred_pair = model.predict([x_test, m_test], verbose=0)
 test_score_preg, test_true_preg = aggregate_to_pregnancy(test_pred_pair, g_test, y_test_preg)
 test_pred_cls = (test_score_preg >= 0.5).astype(int)
 test_preg_acc = accuracy_score(test_true_preg.astype(int), test_pred_cls)
-n_test_hc = int(np.sum(test_true_preg == 0))
 test_auc, test_bar_hc, test_bar_rd = save_auc_and_bar(
-    test_true_preg, test_score_preg, n_test_hc, save_dir, prefix="Test"
+    test_true_preg, test_score_preg, save_dir, prefix="Test"
 )
 
 
