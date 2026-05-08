@@ -1,0 +1,327 @@
+"""
+Single-channel Raman CNN for binary classification (STEP2).
+
+Inputs
+------
+Raman : (N, 800, 1)   # Raman spectrum
+
+Output
+------
+Binary probability per sample (sigmoid).
+
+Pipeline
+--------
+1. Load Raman spectra and 4-class fetal labels from a .npy file.
+2. Binarize labels: 0 -> 0, {1, 2, 3} -> 1.
+3. Stratified train / validation split.
+4. Class-balance the training fold by undersampling the majority class.
+5. Train CNN with binary cross-entropy.
+6. Evaluate on the held-out validation set.
+"""
+
+import os
+import json
+import datetime
+
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, auc, accuracy_score, confusion_matrix
+
+from tensorflow.keras.layers import (
+    Input, Conv1D, BatchNormalization, Activation,
+    AveragePooling1D, Flatten, Dense, Dropout,
+)
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import RMSprop
+
+
+# ---- Paths and settings ----
+STEP2_DIR   = r"D:\KSM\RD AF\data\step2\step2_RD_only"
+RESULT_ROOT = r"D:\KSM\RD AF\Result"
+
+TRAIN_NPY = os.path.join(STEP2_DIR, "RD_step2_train_ALL.npy")
+
+VAL_RATIO = 0.2
+SEED = 42
+
+EPOCHS = 200
+BATCH_SIZE = 127
+LEARNING_RATE = 7e-3
+DECAY = 0.05
+REG = 1e-3
+DROPOUT = 0.8
+
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+
+# ---- Model ----
+def build_model(reg, dropout, learning_rate, decay):
+    r_in = Input(shape=(800, 1), name="raman")
+
+    x = Conv1D(64, 3, padding="same", kernel_regularizer=l2(reg))(r_in)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(64, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(128, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(256, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(512, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Flatten()(x)
+    x = Dense(512, activation="relu", kernel_regularizer=l2(reg))(x)
+    x = Dense(512, kernel_regularizer=l2(reg))(x)
+    x = Activation("relu")(x)
+    x = Dropout(dropout)(x)
+
+    x = Dense(256, activation="relu", kernel_regularizer=l2(reg))(x)
+    x = Dense(256, kernel_regularizer=l2(reg))(x)
+    x = Activation("relu")(x)
+
+    out = Dense(1, activation="sigmoid")(x)
+
+    model = tf.keras.Model(r_in, out)
+    model.compile(
+        optimizer=RMSprop(learning_rate=learning_rate, decay=decay),
+        loss="binary_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
+# ---- Output helpers ----
+def make_save_dir(result_root):
+    now = datetime.datetime.now()
+    day = now.strftime("%y%m%d")
+    time_tag = now.strftime("%H_%M_%S")
+    exp_name = (
+        f"BS{BATCH_SIZE}_LR{LEARNING_RATE}_DECAY{DECAY}"
+        f"_DO{DROPOUT}_REG{REG}_{time_tag}"
+    )
+    save_dir = os.path.join(result_root, day, exp_name)
+    os.makedirs(save_dir, exist_ok=True)
+    return save_dir
+
+
+def save_training_curves(history, save_dir):
+    fig = plt.figure(figsize=(10, 7))
+
+    plt.subplot(211)
+    plt.plot(history.history["accuracy"], linewidth=2)
+    plt.plot(history.history["val_accuracy"], linewidth=2)
+    plt.ylabel("accuracy")
+    plt.legend(["train", "val"], loc="upper left")
+    plt.grid(True, alpha=0.25)
+
+    plt.subplot(212)
+    plt.plot(history.history["loss"], linewidth=2)
+    plt.plot(history.history["val_loss"], linewidth=2)
+    plt.ylabel("loss")
+    plt.xlabel("epoch")
+    plt.legend(["train", "val"], loc="upper left")
+    plt.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    fig.savefig(os.path.join(save_dir, "training_curve.png"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    np.savetxt(os.path.join(save_dir, "train_loss.csv"), history.history["loss"], delimiter=",")
+    np.savetxt(os.path.join(save_dir, "val_loss.csv"), history.history["val_loss"], delimiter=",")
+    np.savetxt(os.path.join(save_dir, "train_acc.csv"), history.history["accuracy"], delimiter=",")
+    np.savetxt(os.path.join(save_dir, "val_acc.csv"), history.history["val_accuracy"], delimiter=",")
+
+
+def save_auc_and_bar(y_true, y_score, save_dir, prefix):
+    fpr, tpr, thr = roc_curve(y_true, y_score)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(5, 5))
+    plt.title(f"{prefix} AUC={roc_auc:.4f}", fontsize=14)
+    plt.plot(fpr, tpr, marker=".")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{prefix}_AUC_{roc_auc:.4f}.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    idx0 = np.where(y_true == 0)[0]
+    idx1 = np.where(y_true == 1)[0]
+    bar0 = y_score[idx0]
+    bar1 = y_score[idx1]
+
+    pos0 = np.arange(0, len(bar0))
+    pos1 = np.arange(len(bar0) + 2, len(bar0) + 2 + len(bar1))
+
+    plt.figure(figsize=(8, 4))
+    plt.bar(pos0, bar0, 0.5, label="label0")
+    plt.bar(pos1, bar1, 0.5, label="label1")
+    plt.title(f"{prefix} bar AUC={roc_auc:.4f}", fontsize=14)
+    plt.ylim(0, 1)
+    plt.ylabel("Predicted score")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{prefix}_Bar_{roc_auc:.4f}.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    np.savetxt(os.path.join(save_dir, f"{prefix}_fpr.csv"), fpr, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_tpr.csv"), tpr, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_thresholds.csv"), thr, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_y_true.csv"), y_true, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_y_score.csv"), y_score, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_bar0.csv"), bar0, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_bar1.csv"), bar1, delimiter=",")
+    return roc_auc
+
+
+# ---- Load data ----
+# .npy layout: (N, 802) -> [0:800] Raman | [800] maternal id | [801] fetal_label (0..3)
+train = np.load(TRAIN_NPY)
+x_full  = train[:, :800].astype(np.float32)[..., None]
+y4_full = train[:, 801].astype(int)
+y_full  = (y4_full >= 1).astype(np.float32)
+
+print("Data shape:", x_full.shape)
+print("Binary label counts:", dict(zip(*np.unique(y_full.astype(int), return_counts=True))))
+
+
+# ---- Stratified train/val split ----
+tr_idx, val_idx = train_test_split(
+    np.arange(len(y_full)),
+    test_size=VAL_RATIO,
+    stratify=y_full.astype(int),
+    random_state=SEED,
+)
+
+x_tr_raw = x_full[tr_idx]
+y_tr_raw = y_full[tr_idx]
+x_val    = x_full[val_idx]
+y_val    = y_full[val_idx]
+
+
+# ---- Class-balance the training fold by undersampling the majority class ----
+idx0 = np.where(y_tr_raw == 0)[0]
+idx1 = np.where(y_tr_raw == 1)[0]
+n0, n1 = len(idx0), len(idx1)
+if n0 == 0 or n1 == 0:
+    raise ValueError("Training set is missing one of the classes.")
+
+if n1 > n0:
+    idx1_sel = np.random.choice(idx1, size=n0, replace=False)
+    idx_sel  = np.concatenate([idx0, idx1_sel])
+else:
+    idx0_sel = np.random.choice(idx0, size=n1, replace=False)
+    idx_sel  = np.concatenate([idx0_sel, idx1])
+
+np.random.shuffle(idx_sel)
+x_tr = x_tr_raw[idx_sel]
+y_tr = y_tr_raw[idx_sel]
+
+
+# ---- Output directory and config ----
+save_dir = make_save_dir(RESULT_ROOT)
+
+with open(os.path.join(save_dir, "run_config.json"), "w", encoding="utf-8") as f:
+    json.dump({
+        "TRAIN_NPY": TRAIN_NPY,
+        "VAL_RATIO": VAL_RATIO,
+        "SEED": SEED,
+        "EPOCHS": EPOCHS,
+        "BATCH_SIZE": BATCH_SIZE,
+        "LEARNING_RATE": LEARNING_RATE,
+        "DECAY": DECAY,
+        "REG": REG,
+        "DROPOUT": DROPOUT,
+        "label_rule": "0 if fetal_label == 0 else 1",
+    }, f, indent=2)
+
+np.savetxt(os.path.join(save_dir, "train_idx.csv"),          tr_idx,  fmt="%d", delimiter=",")
+np.savetxt(os.path.join(save_dir, "val_idx.csv"),            val_idx, fmt="%d", delimiter=",")
+np.savetxt(os.path.join(save_dir, "train_idx_balanced.csv"), idx_sel, fmt="%d", delimiter=",")
+
+
+# ---- Train ----
+model = build_model(reg=REG, dropout=DROPOUT, learning_rate=LEARNING_RATE, decay=DECAY)
+
+history = model.fit(
+    x_tr, y_tr,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    validation_data=(x_val, y_val),
+    verbose=1,
+)
+
+save_training_curves(history, save_dir)
+
+
+# ---- Evaluate ----
+val_loss, val_acc_keras = model.evaluate(x_val, y_val, verbose=0)
+val_pred = model.predict(x_val, verbose=0).reshape(-1)
+val_pred_cls = (val_pred >= 0.5).astype(int)
+val_acc = accuracy_score(y_val.astype(int), val_pred_cls)
+val_cm  = confusion_matrix(y_val.astype(int), val_pred_cls)
+val_auc = save_auc_and_bar(y_val, val_pred, save_dir, prefix="Val")
+
+np.savetxt(os.path.join(save_dir, "val_pred_prob.csv"),       val_pred,  delimiter=",")
+np.savetxt(os.path.join(save_dir, "val_y_true.csv"),          y_val,     delimiter=",")
+np.savetxt(os.path.join(save_dir, "Val_confusion_matrix.csv"), val_cm,   fmt="%d", delimiter=",")
+
+np.savetxt(
+    os.path.join(save_dir, "parameters.csv"),
+    np.array([BATCH_SIZE, LEARNING_RATE, DECAY, DROPOUT, REG], dtype=np.float32).reshape(1, -1),
+    delimiter=",",
+)
+
+with open(os.path.join(save_dir, "AUC.txt"), "w") as f:
+    f.write(f"Val_AUC={val_auc:.6f}\n")
+    f.write(f"Val_ACC={val_acc:.6f}\n")
+
+
+# ---- Save model ----
+with open(os.path.join(save_dir, "model.json"), "w") as f:
+    f.write(model.to_json())
+model.save_weights(os.path.join(save_dir, "model_weights.h5"))
+
+
+# ---- Summary ----
+summary = {
+    "train_raw_n":      int(len(tr_idx)),
+    "train_balanced_n": int(len(y_tr)),
+    "val_n":            int(len(val_idx)),
+    "val_loss":         float(val_loss),
+    "val_acc_keras":    float(val_acc_keras),
+    "val_acc":          float(val_acc),
+    "val_auc":          float(val_auc),
+    "last_train_acc":   float(history.history["accuracy"][-1]),
+    "last_val_acc":     float(history.history["val_accuracy"][-1]),
+    "last_train_loss":  float(history.history["loss"][-1]),
+    "last_val_loss":    float(history.history["val_loss"][-1]),
+}
+with open(os.path.join(save_dir, "summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"Save dir: {save_dir}")
+print(f"Val AUC = {val_auc:.4f}, Val ACC = {val_acc:.4f}")
