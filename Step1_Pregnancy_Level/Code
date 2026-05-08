@@ -1,0 +1,510 @@
+"""
+[Step1] Twin-pair CNN + Maternal MLP for pregnancy-level binary classification
+from Raman spectra.
+
+Inputs
+------
+Raman pair : (800, 2)        # fetus1, fetus2 spectra as channels
+Maternal   : (P,)            # [age, height, weight, BMI, gestational age]
+
+Pipeline
+--------
+1. Load pregnancy-level Raman tensors and maternal tables.
+2. Stratified pregnancy-level train / validation split.
+3. Expand to pair-level samples (n_per_pair per pregnancy).
+4. Train CNN(Raman) + MLP(Maternal) -> sigmoid.
+5. Aggregate pair-level predictions to pregnancy-level by averaging.
+6. Evaluate on held-out validation and independent test sets.
+"""
+
+import os
+import json
+import datetime
+
+import numpy as np
+import h5py
+import tensorflow as tf
+from tensorflow.keras.layers import (
+    Input, Conv1D, BatchNormalization, Activation,
+    AveragePooling1D, Flatten, Dense, Dropout, Concatenate,
+)
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import RMSprop
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, auc, accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+
+
+# ---- Paths and settings ----
+MAT_PATH = r"D:\KSM\RD AF\data\label2\Raman_split_fetus12.mat"
+
+HC_TRAIN_MATERNAL_CSV = r"D:\KSM\RD AF\data\label2\HC_train_maternal.csv"
+HC_TEST_MATERNAL_CSV  = r"D:\KSM\RD AF\data\label2\HC_test_maternal.csv"
+RD_TRAIN_MATERNAL_CSV = r"D:\KSM\RD AF\data\label2\RD_train_maternal.csv"
+RD_TEST_MATERNAL_CSV  = r"D:\KSM\RD AF\data\label2\RD_test_maternal.csv"
+
+RESULT_ROOT = r"D:\KSM\RD AF\Result"
+
+USE_MATERNAL_ID_AS_FEATURE = False    # if False, maternal feature = [age, height, wt, bmi, ga]
+N_PER_PAIR = 100                      # SERS spectra per pregnancy
+VAL_RATIO = 0.2
+SEED = 42
+
+EPOCHS = 200
+BATCH_SIZE = 433
+LEARNING_RATE = 1.8e-3
+DECAY = 0.1
+REG = 1e-4
+DROPOUT = 0.2
+
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+
+# ---- Data loading ----
+def _load_mat_var(f, name):
+    """Return a 2D array with shape (800, n_columns) regardless of MATLAB orientation."""
+    x = np.array(f[name]).squeeze()
+    if x.ndim == 2:
+        if x.shape[0] == 800:
+            return x
+        if x.shape[1] == 800:
+            return x.T
+    return x
+
+
+def load_raman_pregnancy_tensor(mat_path, split_prefix, n_per_pair=100):
+    """
+    Read Raman fetus1/fetus2 spectra and reshape into a pregnancy-level tensor.
+
+    Returns
+    -------
+    x_preg   : ndarray (n_preg, 800, n_per_pair, 2)
+    mid_preg : ndarray (n_preg,) maternal IDs
+    """
+    with h5py.File(mat_path, "r") as f:
+        f1 = _load_mat_var(f, f"{split_prefix}_f1")
+        f2 = _load_mat_var(f, f"{split_prefix}_f2")
+        mid_cols = _load_mat_var(f, f"{split_prefix}_mid")
+
+    assert f1.shape == f2.shape, f"{split_prefix}: f1/f2 shape mismatch"
+    assert f1.shape[0] == 800, f"{split_prefix}: Raman length must be 800"
+    assert f1.shape[1] % n_per_pair == 0, (
+        f"{split_prefix}: column count not divisible by {n_per_pair}"
+    )
+
+    n_preg = f1.shape[1] // n_per_pair
+    f1_3d = f1.reshape(800, n_per_pair, n_preg)
+    f2_3d = f2.reshape(800, n_per_pair, n_preg)
+
+    x_preg = np.stack([f1_3d, f2_3d], axis=-1)             # (800, n_per_pair, n_preg, 2)
+    x_preg = np.transpose(x_preg, (2, 0, 1, 3)).astype(np.float32)
+
+    mid_cols = np.array(mid_cols).reshape(-1)
+    mid_preg = mid_cols[::n_per_pair].astype(np.float64)
+    return x_preg, mid_preg
+
+
+def load_maternal_csv(path, use_id_as_feature=False):
+    """
+    Load the maternal table.
+    Expected columns: [id, age, height, weight, bmi, gestational_age].
+    """
+    a = np.genfromtxt(path, delimiter=",")
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    mid = a[:, 0].astype(np.float64)
+    if use_id_as_feature:
+        m = a[:, 0:6].astype(np.float32)
+    else:
+        m = a[:, 1:6].astype(np.float32)
+    return mid, m
+
+
+def assert_same_order(mid_mat, mid_csv, name):
+    """Check that the maternal IDs from MAT and CSV match in order."""
+    if len(mid_mat) != len(mid_csv):
+        raise ValueError(f"{name}: N mismatch mat={len(mid_mat)} csv={len(mid_csv)}")
+    if not np.allclose(mid_mat, mid_csv):
+        diffs = np.where(mid_mat != mid_csv)[0][:10]
+        raise ValueError(f"{name}: maternal id order mismatch at {diffs}")
+
+
+def make_pair_level_dataset(x_preg, m_preg, y_preg, n_per_pair=100):
+    """Expand pregnancy-level tensors into pair-level samples."""
+    n, length, samples_per_preg, channels = x_preg.shape
+    assert (length, samples_per_preg, channels) == (800, n_per_pair, 2)
+
+    x_pair = (
+        np.transpose(x_preg, (0, 2, 1, 3))
+          .reshape(n * samples_per_preg, length, channels)
+          .astype(np.float32)
+    )
+    m_pair = np.repeat(m_preg, repeats=samples_per_preg, axis=0).astype(np.float32)
+    y_pair = np.repeat(y_preg, repeats=samples_per_preg, axis=0).astype(np.float32)
+    g_pair = np.repeat(np.arange(n), repeats=samples_per_preg)
+    return x_pair, m_pair, y_pair, g_pair
+
+
+def aggregate_to_pregnancy(pred_pair, g_pair, y_preg):
+    """Average pair-level predictions per pregnancy."""
+    pred = np.array(pred_pair).reshape(-1)
+    n = len(y_preg)
+    y_score = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        y_score[i] = pred[g_pair == i].mean()
+    return y_score, y_preg.astype(np.float32)
+
+
+# ---- Model ----
+def build_model(reg, dropout, learning_rate, decay, maternal_dim):
+    r_in = Input(shape=(800, 2), name="raman_pair")
+    m_in = Input(shape=(maternal_dim,), name="maternal")
+
+    x = Conv1D(64, 3, padding="same", kernel_regularizer=l2(reg))(r_in)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(64, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(128, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(256, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Conv1D(512, 3, padding="same", kernel_regularizer=l2(reg))(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = AveragePooling1D(pool_size=2, strides=2, padding="same")(x)
+
+    x = Flatten()(x)
+    x = Dense(512, activation="relu", name="fcl1", kernel_regularizer=l2(reg))(x)
+    x = Dense(512, name="fcl2", kernel_regularizer=l2(reg))(x)
+    x = Activation("relu")(x)
+    x = Dropout(dropout)(x)
+
+    x = Dense(256, activation="relu", name="fcl3", kernel_regularizer=l2(reg))(x)
+    x = Dense(256, name="fcl4", kernel_regularizer=l2(reg))(x)
+    x = Activation("relu")(x)
+
+    m = Dense(64, activation="relu", kernel_regularizer=l2(reg))(m_in)
+    m = Dropout(min(dropout, 0.5))(m)
+    m = Dense(32, activation="relu", kernel_regularizer=l2(reg))(m)
+
+    z = Concatenate()([x, m])
+    z = Dense(64, activation="relu", kernel_regularizer=l2(reg))(z)
+    z = Dropout(min(dropout, 0.5))(z)
+    out = Dense(1, activation="sigmoid")(z)
+
+    model = tf.keras.Model([r_in, m_in], out)
+    model.compile(
+        optimizer=RMSprop(learning_rate=learning_rate, decay=decay),
+        loss="binary_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
+# ---- Output helpers ----
+def make_save_dir(result_root):
+    now = datetime.datetime.now()
+    day = now.strftime("%y%m%d")
+    time_tag = now.strftime("%H_%M_%S")
+    exp_name = (
+        f"BS{BATCH_SIZE}_LR{LEARNING_RATE}_DECAY{DECAY}"
+        f"_DO{DROPOUT}_REG{REG}_{time_tag}"
+    )
+    save_dir = os.path.join(result_root, day, exp_name)
+    os.makedirs(save_dir, exist_ok=True)
+    return save_dir
+
+
+def save_training_curves(history, save_dir):
+    fig = plt.figure(figsize=(10, 7))
+
+    plt.subplot(211)
+    plt.plot(history.history["accuracy"], linewidth=2)
+    plt.plot(history.history["val_accuracy"], linewidth=2)
+    plt.ylabel("accuracy")
+    plt.legend(["train", "val"], loc="upper left")
+    plt.grid(True, alpha=0.25)
+
+    plt.subplot(212)
+    plt.plot(history.history["loss"], linewidth=2)
+    plt.plot(history.history["val_loss"], linewidth=2)
+    plt.ylabel("loss")
+    plt.xlabel("epoch")
+    plt.legend(["train", "val"], loc="upper left")
+    plt.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    fig.savefig(os.path.join(save_dir, "training_curve.png"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    np.savetxt(os.path.join(save_dir, "train_loss.csv"), history.history["loss"], delimiter=",")
+    np.savetxt(os.path.join(save_dir, "val_loss.csv"), history.history["val_loss"], delimiter=",")
+    np.savetxt(os.path.join(save_dir, "train_acc.csv"), history.history["accuracy"], delimiter=",")
+    np.savetxt(os.path.join(save_dir, "val_acc.csv"), history.history["val_accuracy"], delimiter=",")
+
+
+def save_auc_and_bar(y_true, y_score, n_hc, save_dir, prefix):
+    fpr, tpr, thr = roc_curve(y_true, y_score)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(5, 5))
+    plt.title(f"{prefix} AUC={roc_auc:.4f}", fontsize=15)
+    plt.plot(fpr, tpr, marker=".")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{prefix}_AUC_{roc_auc:.4f}.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    bar_hc = y_score[:n_hc]
+    bar_rd = y_score[n_hc:]
+    idx_hc = np.arange(0, len(bar_hc))
+    idx_rd = np.arange(len(bar_hc) + 2, len(bar_hc) + 2 + len(bar_rd))
+
+    plt.figure(figsize=(8, 4))
+    plt.bar(idx_hc, bar_hc, 0.5, label="HC")
+    plt.bar(idx_rd, bar_rd, 0.5, label="RD")
+    plt.title(f"{prefix} bar AUC={roc_auc:.4f}", fontsize=15)
+    plt.ylim(0, 1)
+    plt.ylabel("Predicted score")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{prefix}_Bar_{roc_auc:.4f}.png"),
+                dpi=300, bbox_inches="tight")
+    plt.close()
+
+    np.savetxt(os.path.join(save_dir, f"{prefix}_fpr.csv"), fpr, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_tpr.csv"), tpr, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_thresholds.csv"), thr, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_y_score_preg.csv"), y_score, delimiter=",")
+    np.savetxt(os.path.join(save_dir, f"{prefix}_y_true_preg.csv"), y_true, delimiter=",")
+    return roc_auc, bar_hc, bar_rd
+
+
+# ---- Load data ----
+x_hc_tr_preg, mid_hc_tr = load_raman_pregnancy_tensor(MAT_PATH, "HC_train", N_PER_PAIR)
+x_hc_te_preg, mid_hc_te = load_raman_pregnancy_tensor(MAT_PATH, "HC_test",  N_PER_PAIR)
+x_rd_tr_preg, mid_rd_tr = load_raman_pregnancy_tensor(MAT_PATH, "RD_train", N_PER_PAIR)
+x_rd_te_preg, mid_rd_te = load_raman_pregnancy_tensor(MAT_PATH, "RD_test",  N_PER_PAIR)
+
+mid_csv_hc_tr, m_hc_tr = load_maternal_csv(HC_TRAIN_MATERNAL_CSV, USE_MATERNAL_ID_AS_FEATURE)
+mid_csv_hc_te, m_hc_te = load_maternal_csv(HC_TEST_MATERNAL_CSV,  USE_MATERNAL_ID_AS_FEATURE)
+mid_csv_rd_tr, m_rd_tr = load_maternal_csv(RD_TRAIN_MATERNAL_CSV, USE_MATERNAL_ID_AS_FEATURE)
+mid_csv_rd_te, m_rd_te = load_maternal_csv(RD_TEST_MATERNAL_CSV,  USE_MATERNAL_ID_AS_FEATURE)
+
+assert_same_order(mid_hc_tr, mid_csv_hc_tr, "HC_train")
+assert_same_order(mid_hc_te, mid_csv_hc_te, "HC_test")
+assert_same_order(mid_rd_tr, mid_csv_rd_tr, "RD_train")
+assert_same_order(mid_rd_te, mid_csv_rd_te, "RD_test")
+
+y_hc_tr_preg = np.zeros(len(mid_hc_tr), dtype=np.float32)
+y_hc_te_preg = np.zeros(len(mid_hc_te), dtype=np.float32)
+y_rd_tr_preg = np.ones(len(mid_rd_tr),  dtype=np.float32)
+y_rd_te_preg = np.ones(len(mid_rd_te),  dtype=np.float32)
+
+x_train_preg = np.concatenate([x_hc_tr_preg, x_rd_tr_preg], axis=0)
+m_train_preg = np.concatenate([m_hc_tr, m_rd_tr], axis=0)
+y_train_preg = np.concatenate([y_hc_tr_preg, y_rd_tr_preg], axis=0)
+
+x_test_preg = np.concatenate([x_hc_te_preg, x_rd_te_preg], axis=0)
+m_test_preg = np.concatenate([m_hc_te, m_rd_te], axis=0)
+y_test_preg = np.concatenate([y_hc_te_preg, y_rd_te_preg], axis=0)
+
+
+# ---- Stratified pregnancy-level train/val split ----
+tr_idx, val_idx = train_test_split(
+    np.arange(len(y_train_preg)),
+    test_size=VAL_RATIO,
+    stratify=y_train_preg.astype(int),
+    random_state=SEED,
+)
+
+x_tr_preg, m_tr_preg, y_tr_preg = x_train_preg[tr_idx], m_train_preg[tr_idx], y_train_preg[tr_idx]
+x_val_preg, m_val_preg, y_val_preg = x_train_preg[val_idx], m_train_preg[val_idx], y_train_preg[val_idx]
+
+
+# ---- Pair-level expansion ----
+x_tr,  m_tr_raw,  y_tr,  g_tr  = make_pair_level_dataset(x_tr_preg,  m_tr_preg,  y_tr_preg,  N_PER_PAIR)
+x_val, m_val_raw, y_val, g_val = make_pair_level_dataset(x_val_preg, m_val_preg, y_val_preg, N_PER_PAIR)
+x_test, m_test_raw, y_test, g_test = make_pair_level_dataset(
+    x_test_preg, m_test_preg, y_test_preg, N_PER_PAIR
+)
+
+
+# ---- Maternal feature normalization (fit on train only) ----
+m_tr_raw   = np.nan_to_num(m_tr_raw,   nan=0.0, posinf=0.0, neginf=0.0)
+m_val_raw  = np.nan_to_num(m_val_raw,  nan=0.0, posinf=0.0, neginf=0.0)
+m_test_raw = np.nan_to_num(m_test_raw, nan=0.0, posinf=0.0, neginf=0.0)
+
+mu = m_tr_raw.mean(axis=0, keepdims=True)
+sd = m_tr_raw.std(axis=0,  keepdims=True) + 1e-6
+
+m_tr   = (m_tr_raw   - mu) / sd
+m_val  = (m_val_raw  - mu) / sd
+m_test = (m_test_raw - mu) / sd
+
+print("x_tr  :", x_tr.shape,   "m_tr  :", m_tr.shape,   "y_tr  :", y_tr.shape)
+print("x_val :", x_val.shape,  "m_val :", m_val.shape,  "y_val :", y_val.shape)
+print("x_test:", x_test.shape, "m_test:", m_test.shape, "y_test:", y_test.shape)
+
+
+# ---- Output directory and config ----
+save_dir = make_save_dir(RESULT_ROOT)
+parameters = [BATCH_SIZE, LEARNING_RATE, DECAY, DROPOUT, REG]
+
+with open(os.path.join(save_dir, "run_config.json"), "w", encoding="utf-8") as f:
+    json.dump({
+        "MAT_PATH": MAT_PATH,
+        "HC_TRAIN_MATERNAL_CSV": HC_TRAIN_MATERNAL_CSV,
+        "HC_TEST_MATERNAL_CSV":  HC_TEST_MATERNAL_CSV,
+        "RD_TRAIN_MATERNAL_CSV": RD_TRAIN_MATERNAL_CSV,
+        "RD_TEST_MATERNAL_CSV":  RD_TEST_MATERNAL_CSV,
+        "USE_MATERNAL_ID_AS_FEATURE": USE_MATERNAL_ID_AS_FEATURE,
+        "N_PER_PAIR": N_PER_PAIR,
+        "VAL_RATIO": VAL_RATIO,
+        "SEED": SEED,
+        "EPOCHS": EPOCHS,
+        "BATCH_SIZE": BATCH_SIZE,
+        "LEARNING_RATE": LEARNING_RATE,
+        "DECAY": DECAY,
+        "REG": REG,
+        "DROPOUT": DROPOUT,
+    }, f, indent=2)
+
+np.savetxt(os.path.join(save_dir, "mu.csv"), mu, delimiter=",")
+np.savetxt(os.path.join(save_dir, "sd.csv"), sd, delimiter=",")
+np.savetxt(os.path.join(save_dir, "train_preg_idx.csv"), tr_idx, fmt="%d", delimiter=",")
+np.savetxt(os.path.join(save_dir, "val_preg_idx.csv"),   val_idx, fmt="%d", delimiter=",")
+np.savetxt(
+    os.path.join(save_dir, "parameters.csv"),
+    np.array(parameters, dtype=np.float32).reshape(1, -1),
+    delimiter=",",
+)
+
+
+# ---- Train ----
+model = build_model(
+    reg=REG,
+    dropout=DROPOUT,
+    learning_rate=LEARNING_RATE,
+    decay=DECAY,
+    maternal_dim=m_tr.shape[1],
+)
+
+history = model.fit(
+    [x_tr, m_tr], y_tr,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    validation_data=([x_val, m_val], y_val),
+    verbose=1,
+)
+
+save_training_curves(history, save_dir)
+
+
+# ---- Evaluate ----
+val_loss,  val_acc  = model.evaluate([x_val,  m_val],  y_val,  verbose=0)
+test_loss, test_acc = model.evaluate([x_test, m_test], y_test, verbose=0)
+
+val_pred_pair = model.predict([x_val, m_val], verbose=0)
+val_score_preg, val_true_preg = aggregate_to_pregnancy(val_pred_pair, g_val, y_val_preg)
+val_pred_cls = (val_score_preg >= 0.5).astype(int)
+val_preg_acc = accuracy_score(val_true_preg.astype(int), val_pred_cls)
+n_val_hc = int(np.sum(val_true_preg == 0))
+val_auc, val_bar_hc, val_bar_rd = save_auc_and_bar(
+    val_true_preg, val_score_preg, n_val_hc, save_dir, prefix="Val"
+)
+
+test_pred_pair = model.predict([x_test, m_test], verbose=0)
+test_score_preg, test_true_preg = aggregate_to_pregnancy(test_pred_pair, g_test, y_test_preg)
+test_pred_cls = (test_score_preg >= 0.5).astype(int)
+test_preg_acc = accuracy_score(test_true_preg.astype(int), test_pred_cls)
+n_test_hc = int(np.sum(test_true_preg == 0))
+test_auc, test_bar_hc, test_bar_rd = save_auc_and_bar(
+    test_true_preg, test_score_preg, n_test_hc, save_dir, prefix="Test"
+)
+
+
+# ---- Save predictions and confusion matrices ----
+np.savetxt(os.path.join(save_dir, "val_pred_pair.csv"), val_pred_pair.reshape(-1), delimiter=",")
+np.savetxt(os.path.join(save_dir, "val_y_pair.csv"),    y_val,                     delimiter=",")
+np.savetxt(os.path.join(save_dir, "val_g_pair.csv"),    g_val, fmt="%d",           delimiter=",")
+
+np.savetxt(os.path.join(save_dir, "test_pred_pair.csv"), test_pred_pair.reshape(-1), delimiter=",")
+np.savetxt(os.path.join(save_dir, "test_y_pair.csv"),    y_test,                     delimiter=",")
+np.savetxt(os.path.join(save_dir, "test_g_pair.csv"),    g_test, fmt="%d",           delimiter=",")
+
+np.savetxt(os.path.join(save_dir, "Val_HC_score.csv"),  val_bar_hc,  delimiter=",")
+np.savetxt(os.path.join(save_dir, "Val_RD_score.csv"),  val_bar_rd,  delimiter=",")
+np.savetxt(os.path.join(save_dir, "Test_HC_score.csv"), test_bar_hc, delimiter=",")
+np.savetxt(os.path.join(save_dir, "Test_RD_score.csv"), test_bar_rd, delimiter=",")
+
+val_cm  = confusion_matrix(val_true_preg.astype(int),  val_pred_cls)
+test_cm = confusion_matrix(test_true_preg.astype(int), test_pred_cls)
+np.savetxt(os.path.join(save_dir, "Val_confusion_matrix.csv"),  val_cm,  fmt="%d", delimiter=",")
+np.savetxt(os.path.join(save_dir, "Test_confusion_matrix.csv"), test_cm, fmt="%d", delimiter=",")
+
+n_hc_test = len(y_hc_te_preg)
+np.savetxt(
+    os.path.join(save_dir, "HC_output.txt"),
+    test_pred_pair[:n_hc_test * N_PER_PAIR],
+    fmt="%.18e", delimiter=",",
+)
+np.savetxt(
+    os.path.join(save_dir, "RD_output.txt"),
+    test_pred_pair[n_hc_test * N_PER_PAIR:],
+    fmt="%.18e", delimiter=",",
+)
+
+with open(os.path.join(save_dir, "AUC.txt"), "w") as f:
+    f.write(f"Val_AUC={val_auc:.6f}\n")
+    f.write(f"Test_AUC={test_auc:.6f}\n")
+
+
+# ---- Save model ----
+with open(os.path.join(save_dir, "model.json"), "w") as f:
+    f.write(model.to_json())
+model.save_weights(os.path.join(save_dir, "model_weights.h5"))
+
+
+# ---- Summary ----
+summary = {
+    "train_preg_n":     int(len(tr_idx)),
+    "val_preg_n":       int(len(val_idx)),
+    "test_preg_n":      int(len(y_test_preg)),
+    "val_pair_loss":    float(val_loss),
+    "val_pair_acc":     float(val_acc),
+    "val_preg_acc":     float(val_preg_acc),
+    "val_auc":          float(val_auc),
+    "test_pair_loss":   float(test_loss),
+    "test_pair_acc":    float(test_acc),
+    "test_preg_acc":    float(test_preg_acc),
+    "test_auc":         float(test_auc),
+    "last_train_acc":   float(history.history["accuracy"][-1]),
+    "last_val_acc":     float(history.history["val_accuracy"][-1]),
+    "last_train_loss":  float(history.history["loss"][-1]),
+    "last_val_loss":    float(history.history["val_loss"][-1]),
+}
+with open(os.path.join(save_dir, "summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"Save dir: {save_dir}")
+print(f"Val  AUC = {val_auc:.4f}, Val  ACC = {val_preg_acc:.4f}")
+print(f"Test AUC = {test_auc:.4f}, Test ACC = {test_preg_acc:.4f}")
